@@ -12,7 +12,7 @@ import json
 CONFIG_FILE = "/opt/outline-monitor/config.json"
 
 def detect_outline_ports():
-    """Outline server portlarını otomatik tespit et"""
+    """Outline server portlarını auto detection"""
     try:
         cmd = "ss -tuln | awk 'NR>1 {print $5}' | grep -oE ':[0-9]+$' | cut -c2- | sort -n | uniq"
         result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=5)
@@ -38,7 +38,7 @@ def detect_outline_ports():
         return [], []
 
 def get_outline_management_port():
-    """Kullanıcıdan Outline Management portunu al"""
+    """Get Outline Management port from user"""
     print("\n" + "="*60)
     print("🔍 OUTLINE SERVER PORT DETECTION")
     print("="*60)
@@ -79,7 +79,7 @@ def get_outline_management_port():
             sys.exit(1)
 
 def save_config(management_port):
-    """Konfigürasyonu dosyaya kaydet"""
+    """Konfigürasyonu save to file"""
     config = {
         "management_port": management_port,
         "monitor_range": [1024, 65535],
