@@ -15,17 +15,27 @@ CONFIG_FILE = '/opt/outline-monitor/config.json'
 def detect_outline_port():
     """Try to detect Outline Server management port automatically"""
     try:
-        # Check for common Outline processes
-        result = subprocess.run(['netstat', '-tlnp'], capture_output=True, text=True)
+        # Check for common Outline processes using ss command (more common than netstat)
+        try:
+            result = subprocess.run(['ss', '-tlnp'], capture_output=True, text=True)
+            cmd_output = result.stdout
+        except FileNotFoundError:
+            # Fallback to netstat if ss is not available
+            try:
+                result = subprocess.run(['netstat', '-tlnp'], capture_output=True, text=True)
+                cmd_output = result.stdout
+            except FileNotFoundError:
+                print("⚠️  Neither 'ss' nor 'netstat' commands are available")
+                return []
         
         # Look for processes listening on management-like ports
         management_ports = []
-        for line in result.stdout.split('\n'):
+        for line in cmd_output.split('\n'):
             if ':' in line and 'LISTEN' in line:
                 try:
-                    # Extract port from netstat output
+                    # Extract port from output
                     parts = line.split()
-                    local_address = parts[3]
+                    local_address = parts[3] if len(parts) > 3 else ""
                     port = int(local_address.split(':')[-1])
                     
                     # Check if this might be Outline management port
@@ -196,7 +206,7 @@ def main():
             
             current_port = existing_config.get('management_port', 'unknown')
             print(f"\n⚠️  Configuration already exists")
-            print(f"� Current management port: {current_port}")
+            print(f"📡 Current management port: {current_port}")
             
             response = safe_input("Reconfigure? (y/n)", "n")
             if response.lower() not in ['y', 'yes']:
@@ -220,7 +230,7 @@ def main():
         if save_config(management_port):
             print("✅ Configuration saved successfully!")
             print(f"📁 Config file: {CONFIG_FILE}")
-            print("\n� You can now start the monitor with:")
+            print("\n🚀 You can now start the monitor with:")
             print("   sudo systemctl start outline-monitor")
         else:
             print("❌ Failed to save configuration")
