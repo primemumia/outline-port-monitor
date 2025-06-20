@@ -16,13 +16,13 @@ Advanced port protection system for Outline VPN servers with intelligent IP bloc
 
 ### One-Line Install
 ```bash
-curl -fsSL https://raw.githubusercontent.com/YOUR_USERNAME/outline-port-monitor/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/primemumia/outline-port-monitor/main/install.sh | sudo bash
 ```
 
 ### Manual Installation
 ```bash
 # Download the installer
-wget https://raw.githubusercontent.com/YOUR_USERNAME/outline-port-monitor/main/setup.sh
+wget https://raw.githubusercontent.com/primemumia/outline-port-monitor/main/setup.sh
 
 # Make executable and run
 chmod +x setup.sh

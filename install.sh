@@ -16,7 +16,7 @@ PURPLE='\033[0;35m'
 NC='\033[0m'
 
 # GitHub repository info
-GITHUB_USER="YOUR_USERNAME"
+GITHUB_USER="primemumia"
 GITHUB_REPO="outline-port-monitor"
 GITHUB_BRANCH="main"
 SETUP_URL="https://raw.githubusercontent.com/${GITHUB_USER}/${GITHUB_REPO}/${GITHUB_BRANCH}/setup.sh"
