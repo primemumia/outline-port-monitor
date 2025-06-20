@@ -155,6 +155,489 @@ install_python_script() {
 #!/usr/bin/env python3
 """
 Interactive Outline Monitor - Dynamic Port Protection
+Reads configuration from config file or asks for setup
+"""
+
+import subprocess
+import time
+import re
+import threading
+import signal
+import logging
+import sys
+import os
+import json
+from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import defaultdict
+
+CONFIG_FILE = "/opt/outline-monitor/config.json"
+
+def setup_logging():
+    """Logging yapılandırması"""
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler('/var/log/outline-monitor.log'),
+            logging.StreamHandler()
+        ]
+    )
+    return logging.getLogger(__name__)
+
+def load_config():
+    """Konfigürasyon dosyasından ayarları yükle"""
+    try:
+        with open(CONFIG_FILE, 'r') as f:
+            config = json.load(f)
+        return config
+    except FileNotFoundError:
+        print(f"❌ Configuration file not found: {CONFIG_FILE}")
+        print("🔧 Please run: outline-monitor setup")
+        return None
+    except json.JSONDecodeError:
+        print(f"❌ Invalid configuration file: {CONFIG_FILE}")
+        return None
+
+def detect_outline_ports():
+    """Outline server portlarını otomatik tespit et"""
+    try:
+        cmd = "ss -tuln | awk 'NR>1 {print $5}' | grep -oE ':[0-9]+$' | cut -c2- | sort -n | uniq"
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=5)
+        
+        active_ports = []
+        for line in result.stdout.split('\n'):
+            if line.strip():
+                try:
+                    port = int(line.strip())
+                    active_ports.append(port)
+                except ValueError:
+                    continue
+        
+        detected_management = []
+        for port in active_ports:
+            if 27000 <= port <= 27100:
+                detected_management.append(port)
+        
+        return detected_management, active_ports
+        
+    except Exception as e:
+        print(f"Port detection error: {e}")
+        return [], []
+
+def get_outline_management_port():
+    """Kullanıcıdan Outline Management portunu al"""
+    print("\n" + "="*60)
+    print("🔍 OUTLINE SERVER PORT DETECTION")
+    print("="*60)
+    
+    detected_mgmt, all_ports = detect_outline_ports()
+    
+    if detected_mgmt:
+        print(f"📡 Detected possible Outline Management ports: {detected_mgmt}")
+        for port in detected_mgmt:
+            choice = input(f"Is {port} your Outline Management port? (y/n): ").lower().strip()
+            if choice in ['y', 'yes']:
+                return port
+    
+    print("\n🔧 Please enter your Outline Server Management port manually:")
+    print("   (This is usually between 27000-27100)")
+    print("   (Check your Outline Manager URL: https://your-ip:PORT)")
+    
+    while True:
+        try:
+            port_input = input("\nOutline Management Port: ").strip()
+            management_port = int(port_input)
+            
+            if 1 <= management_port <= 65535:
+                confirm = input(f"Confirm Outline Management port {management_port}? (y/n): ").lower().strip()
+                if confirm in ['y', 'yes']:
+                    return management_port
+            else:
+                print("❌ Port must be between 1-65535")
+                
+        except ValueError:
+            print("❌ Please enter a valid number")
+        except KeyboardInterrupt:
+            print("\n❌ Setup cancelled")
+            sys.exit(1)
+
+def save_config(management_port):
+    """Konfigürasyonu kaydet"""
+    config = {
+        "management_port": management_port,
+        "monitor_range": [1024, 65535],
+        "check_interval": 1,
+        "block_duration": 120
+    }
+    
+    os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
+    
+    with open(CONFIG_FILE, 'w') as f:
+        json.dump(config, f, indent=2)
+    
+    return config
+
+class InteractiveOutlineMonitor:
+    def __init__(self, config=None):
+        if config is None:
+            # Interactive setup mode
+            print("🔧 Configuration setup required...")
+            management_port = get_outline_management_port()
+            config = save_config(management_port)
+            print(f"\n✅ Configuration saved! Management port: {management_port}")
+        
+        # Load configuration
+        self.management_port = config["management_port"]
+        self.FORBIDDEN_PORTS = [self.management_port]
+        self.dynamic_range = tuple(config["monitor_range"])
+        
+        # Performance ayarları
+        self.CHECK_INTERVAL = config["check_interval"]
+        self.BLOCK_DURATION = config["block_duration"]
+        self.MAX_WORKERS = 15
+        self.BATCH_SIZE = 100
+        
+        # Port yönetimi
+        self.active_ports = {}
+        self.blocked_ips = {}
+        
+        # Monitoring durumu
+        self.running = True
+        self.stats = {
+            'scanned_ports': 0,
+            'active_ports': 0,
+            'blocked_ips': 0,
+            'total_connections': 0
+        }
+        
+        self.executor = ThreadPoolExecutor(max_workers=self.MAX_WORKERS)
+        self.logger = setup_logging()
+    
+    def get_active_ports_safe(self):
+        """Aktif portları tespit et - Management port'u ATLA"""
+        try:
+            cmd = "ss -tuln | awk 'NR>1 {print $5}' | grep -oE ':[0-9]+$' | cut -c2- | sort -n | uniq"
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=5)
+            
+            active_ports = []
+            
+            for line in result.stdout.split('\n'):
+                if line.strip():
+                    try:
+                        port = int(line.strip())
+                        
+                        if port in self.FORBIDDEN_PORTS:
+                            self.logger.debug(f"⚠️  Port {port} FORBIDDEN - Skipped (Management port)")
+                            continue
+                        
+                        if self.dynamic_range[0] <= port <= self.dynamic_range[1]:
+                            active_ports.append(port)
+                            
+                    except ValueError:
+                        continue
+            
+            return active_ports
+            
+        except Exception as e:
+            self.logger.error(f"Active port detection error: {e}")
+            return []
+    
+    def scan_port_ips(self, port):
+        """Tek port'un IP'lerini tara"""
+        try:
+            if port in self.FORBIDDEN_PORTS:
+                self.logger.warning(f"🚨 CRITICAL: Port {port} is forbidden! Skipping!")
+                return []
+            
+            cmd = f"ss -tn state established '( dport = :{port} or sport = :{port} )'"
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=3)
+            
+            unique_ips = set()
+            
+            for line in result.stdout.split('\n'):
+                if f':{port}' in line and not line.startswith('Recv-Q'):
+                    ips = re.findall(r'(?:::ffff:)?(\d+\.\d+\.\d+\.\d+)', line)
+                    for ip in ips:
+                        if not self.is_local_ip(ip):
+                            unique_ips.add(ip)
+            
+            return list(unique_ips)
+            
+        except Exception as e:
+            self.logger.debug(f"Port {port} scan error: {e}")
+            return []
+    
+    def scan_ports_batch(self, ports_batch):
+        """Port batch'ini parallel tara"""
+        batch_results = {}
+        
+        for port in ports_batch:
+            if port in self.FORBIDDEN_PORTS:
+                self.logger.warning(f"🚨 BATCH CHECK: Port {port} forbidden - SKIPPING!")
+                continue
+                
+            ips = self.scan_port_ips(port)
+            if ips:
+                batch_results[port] = ips
+        
+        return batch_results
+    
+    def is_local_ip(self, ip):
+        """Local IP kontrolü"""
+        try:
+            parts = ip.split('.')
+            first = int(parts[0])
+            second = int(parts[1]) if len(parts) > 1 else 0
+            
+            return (first == 10 or first == 127 or 
+                   (first == 192 and second == 168) or
+                   (first == 172 and 16 <= second <= 31))
+        except:
+            return True
+    
+    def block_ip_async(self, ip, port, reason="IP change"):
+        """IP'yi asenkron engelle"""
+        def _block_task():
+            try:
+                if port in self.FORBIDDEN_PORTS:
+                    self.logger.error(f"🚨 CRITICAL ERROR: Port {port} is management port - Blocking CANCELLED!")
+                    return
+                
+                end_time = datetime.now() + timedelta(seconds=self.BLOCK_DURATION)
+                
+                self.logger.warning(f"🚫 Blocking IP {ip} (Port {port}) - {reason}")
+                self.logger.info(f"⏰ Block until: {end_time.strftime('%H:%M:%S')}")
+                
+                commands = [
+                    ['iptables', '-I', 'INPUT', '-s', ip, '-p', 'tcp', '--dport', str(port), '-j', 'DROP'],
+                    ['iptables', '-I', 'INPUT', '-s', ip, '-p', 'udp', '--dport', str(port), '-j', 'DROP'],
+                    ['iptables', '-I', 'OUTPUT', '-d', ip, '-p', 'tcp', '--sport', str(port), '-j', 'DROP'],
+                    ['iptables', '-I', 'OUTPUT', '-d', ip, '-p', 'udp', '--sport', str(port), '-j', 'DROP']
+                ]
+                
+                success_count = 0
+                for cmd in commands:
+                    try:
+                        subprocess.run(cmd, check=True, timeout=5)
+                        success_count += 1
+                    except subprocess.CalledProcessError:
+                        pass
+                
+                if success_count > 0:
+                    block_key = f"{ip}:{port}"
+                    self.blocked_ips[block_key] = end_time
+                    self.stats['blocked_ips'] = len(self.blocked_ips)
+                    self.logger.info(f"✅ IP {ip} blocked for port {port} ({success_count}/4 rules)")
+                    
+                    time.sleep(self.BLOCK_DURATION)
+                    self.unblock_ip(ip, port)
+                
+            except Exception as e:
+                self.logger.error(f"Block task error for IP {ip}: {e}")
+        
+        thread = threading.Thread(target=_block_task, name=f"Block-{ip}-{port}")
+        thread.daemon = True
+        thread.start()
+    
+    def unblock_ip(self, ip, port):
+        """IP engeli kaldır"""
+        try:
+            self.logger.info(f"🔓 Unblocking IP {ip} for port {port}")
+            
+            commands = [
+                ['iptables', '-D', 'INPUT', '-s', ip, '-p', 'tcp', '--dport', str(port), '-j', 'DROP'],
+                ['iptables', '-D', 'INPUT', '-s', ip, '-p', 'udp', '--dport', str(port), '-j', 'DROP'],
+                ['iptables', '-D', 'OUTPUT', '-d', ip, '-p', 'tcp', '--sport', str(port), '-j', 'DROP'],
+                ['iptables', '-D', 'OUTPUT', '-d', ip, '-p', 'udp', '--sport', str(port), '-j', 'DROP']
+            ]
+            
+            for cmd in commands:
+                subprocess.run(cmd, check=False, timeout=5)
+            
+            block_key = f"{ip}:{port}"
+            if block_key in self.blocked_ips:
+                del self.blocked_ips[block_key]
+                self.stats['blocked_ips'] = len(self.blocked_ips)
+            
+            self.logger.info(f"✅ IP {ip} unblocked for port {port}")
+            
+        except Exception as e:
+            self.logger.error(f"Unblock error for IP {ip}:{port}: {e}")
+    
+    def process_port_changes(self, port, current_ips, previous_ips):
+        """Port IP değişimlerini işle"""
+        if not previous_ips:
+            if current_ips:
+                self.active_ports[port] = current_ips.copy()
+                self.logger.info(f"📡 Port {port}: {len(current_ips)} IPs detected")
+            return
+        
+        current_set = set(current_ips)
+        previous_set = set(previous_ips)
+        
+        new_ips = current_set - previous_set
+        lost_ips = previous_set - current_set
+        
+        if new_ips or lost_ips:
+            self.logger.warning(f"🔄 Port {port}: IP change detected!")
+            
+            if new_ips:
+                self.logger.warning(f"🆕 New IPs: {list(new_ips)}")
+                
+                ips_to_block = previous_set - new_ips
+                for old_ip in ips_to_block:
+                    block_key = f"{old_ip}:{port}"
+                    if block_key not in self.blocked_ips:
+                        self.block_ip_async(old_ip, port, "New IP detected")
+            
+            if lost_ips:
+                self.logger.info(f"📤 Lost IPs: {list(lost_ips)}")
+            
+            self.active_ports[port] = current_ips.copy()
+            self.logger.info(f"✅ Port {port}: Updated to {len(current_ips)} active IPs")
+    
+    def main_monitoring_loop(self):
+        """Ana monitoring döngüsü"""
+        scan_count = 0
+        
+        while self.running:
+            start_time = time.time()
+            
+            try:
+                active_ports = self.get_active_ports_safe()
+                
+                if not active_ports:
+                    self.logger.debug("No monitorable ports found")
+                    time.sleep(self.CHECK_INTERVAL)
+                    continue
+                
+                port_batches = [active_ports[i:i + self.BATCH_SIZE] 
+                               for i in range(0, len(active_ports), self.BATCH_SIZE)]
+                
+                futures = []
+                for batch in port_batches:
+                    future = self.executor.submit(self.scan_ports_batch, batch)
+                    futures.append(future)
+                
+                all_results = {}
+                for future in as_completed(futures, timeout=10):
+                    try:
+                        batch_result = future.result()
+                        all_results.update(batch_result)
+                    except Exception as e:
+                        self.logger.error(f"Batch scan error: {e}")
+                
+                changes_detected = 0
+                total_connections = 0
+                
+                for port, current_ips in all_results.items():
+                    if current_ips:
+                        total_connections += len(current_ips)
+                        
+                        previous_ips = self.active_ports.get(port, [])
+                        current_set = set(current_ips)
+                        previous_set = set(previous_ips)
+                        
+                        if current_set != previous_set:
+                            self.process_port_changes(port, current_ips, previous_ips)
+                            changes_detected += 1
+                
+                scan_count += 1
+                elapsed = time.time() - start_time
+                
+                self.stats.update({
+                    'scanned_ports': len(active_ports),
+                    'active_ports': len(all_results),
+                    'total_connections': total_connections
+                })
+                
+                if scan_count % 60 == 0:
+                    blocked_summary = len(self.blocked_ips)
+                    self.logger.info(f"📊 1min Report: {self.stats['active_ports']} active ports, "
+                                  f"{total_connections} total connections, "
+                                  f"{blocked_summary} blocks, {elapsed:.2f}s scan")
+                
+                if changes_detected > 0:
+                    self.logger.info(f"🔄 {changes_detected} port changes detected this scan")
+                
+                sleep_time = max(0.1, self.CHECK_INTERVAL - elapsed)
+                time.sleep(sleep_time)
+                
+            except Exception as e:
+                self.logger.error(f"Main monitoring error: {e}")
+                time.sleep(2)
+    
+    def start(self):
+        """Monitoring başlat"""
+        self.logger.info("🚀 INTERACTIVE Outline Monitor Starting")
+        self.logger.info(f"🚨 PROTECTED MANAGEMENT PORT: {self.management_port}")
+        self.logger.info(f"📡 MONITORING ALL PORTS: {self.dynamic_range[0]}-{self.dynamic_range[1]} (except {self.management_port})")
+        self.logger.info(f"⚡ Ultra Fast Scan: {self.CHECK_INTERVAL}s interval")
+        self.logger.info(f"🚫 Block Duration: {self.BLOCK_DURATION//60}min")
+        self.logger.info(f"🔧 Performance: {self.MAX_WORKERS} workers, {self.BATCH_SIZE} batch size")
+        self.logger.info("=" * 80)
+        
+        try:
+            self.main_monitoring_loop()
+        except KeyboardInterrupt:
+            self.logger.info("⏹️  Shutdown requested...")
+            self.stop()
+    
+    def stop(self):
+        """Güvenli kapatma"""
+        self.running = False
+        
+        self.logger.info("🧹 Clearing all blocks...")
+        blocked_count = len(self.blocked_ips)
+        
+        for block_key in list(self.blocked_ips.keys()):
+            try:
+                ip, port = block_key.split(':')
+                self.unblock_ip(ip, int(port))
+            except Exception as e:
+                self.logger.error(f"Cleanup error for {block_key}: {e}")
+        
+        self.executor.shutdown(wait=True)
+        
+        if blocked_count > 0:
+            self.logger.info(f"✅ Cleared {blocked_count} IP blocks")
+        
+        self.logger.info("✅ INTERACTIVE Outline Monitor stopped safely")
+
+# Signal handling
+monitor = None
+
+def signal_handler(signum, frame):
+    global monitor
+    if monitor:
+        monitor.stop()
+    exit(0)
+
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+
+if __name__ == "__main__":
+    if os.geteuid() != 0:
+        print("❌ This script must be run as root (use sudo)")
+        sys.exit(1)
+    
+    # Load or create configuration
+    config = load_config()
+    
+    if config is None:
+        print("🔧 No configuration found. Running setup...")
+        sys.exit(1)
+    
+    print(f"\n✅ Loaded configuration - Management Port: {config['management_port']}")
+    print("🔄 Starting monitoring system...")
+    
+    monitor = InteractiveOutlineMonitor(config)
+    monitor.start()
+PYTHON_EOF
+#!/usr/bin/env python3
+"""
+Interactive Outline Monitor - Dynamic Port Protection
 Automatically detects or asks for Outline Server port
 Protects Management port + monitors all other ports in 1024-65535 range
 """
@@ -639,7 +1122,126 @@ PYTHON_EOF
     # Make executable
     chmod +x "$INSTALL_DIR/outline_monitor_interactive.py"
     
+    # Create port configuration helper
+    cat > "$INSTALL_DIR/configure.py" << 'CONFIG_EOF'
+#!/usr/bin/env python3
+"""
+Port Configuration Helper for Outline Monitor
+"""
+
+import subprocess
+import sys
+import os
+import json
+
+CONFIG_FILE = "/opt/outline-monitor/config.json"
+
+def detect_outline_ports():
+    """Outline server portlarını otomatik tespit et"""
+    try:
+        cmd = "ss -tuln | awk 'NR>1 {print $5}' | grep -oE ':[0-9]+$' | cut -c2- | sort -n | uniq"
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=5)
+        
+        active_ports = []
+        for line in result.stdout.split('\n'):
+            if line.strip():
+                try:
+                    port = int(line.strip())
+                    active_ports.append(port)
+                except ValueError:
+                    continue
+        
+        detected_management = []
+        for port in active_ports:
+            if 27000 <= port <= 27100:
+                detected_management.append(port)
+        
+        return detected_management, active_ports
+        
+    except Exception as e:
+        print(f"Port detection error: {e}")
+        return [], []
+
+def get_outline_management_port():
+    """Kullanıcıdan Outline Management portunu al"""
+    print("\n" + "="*60)
+    print("🔍 OUTLINE SERVER PORT DETECTION")
+    print("="*60)
+    
+    detected_mgmt, all_ports = detect_outline_ports()
+    
+    if detected_mgmt:
+        print(f"📡 Detected possible Outline Management ports: {detected_mgmt}")
+        for port in detected_mgmt:
+            choice = input(f"Is {port} your Outline Management port? (y/n): ").lower().strip()
+            if choice in ['y', 'yes']:
+                return port
+    
+    print("\n🔧 Please enter your Outline Server Management port manually:")
+    print("   (This is usually between 27000-27100)")
+    print("   (Check your Outline Manager URL: https://your-ip:PORT)")
+    
+    while True:
+        try:
+            port_input = input("\nOutline Management Port: ").strip()
+            management_port = int(port_input)
+            
+            if 1 <= management_port <= 65535:
+                confirm = input(f"Confirm Outline Management port {management_port}? (y/n): ").lower().strip()
+                if confirm in ['y', 'yes']:
+                    return management_port
+            else:
+                print("❌ Port must be between 1-65535")
+                
+        except ValueError:
+            print("❌ Please enter a valid number")
+        except KeyboardInterrupt:
+            print("\n❌ Setup cancelled")
+            sys.exit(1)
+
+def save_config(management_port):
+    """Konfigürasyonu dosyaya kaydet"""
+    config = {
+        "management_port": management_port,
+        "monitor_range": [1024, 65535],
+        "check_interval": 1,
+        "block_duration": 120
+    }
+    
+    os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
+    
+    with open(CONFIG_FILE, 'w') as f:
+        json.dump(config, f, indent=2)
+    
+    print(f"\n✅ Configuration saved to: {CONFIG_FILE}")
+    return True
+
+def main():
+    if os.geteuid() != 0:
+        print("❌ This script must be run as root (use sudo)")
+        sys.exit(1)
+    
+    print("🔧 Outline Monitor - Port Configuration")
+    
+    management_port = get_outline_management_port()
+    
+    if save_config(management_port):
+        print(f"\n✅ Outline Management Port set to: {management_port}")
+        print("🔄 You can now start the monitoring service with: outline-monitor start")
+        return True
+    else:
+        print("❌ Failed to save configuration")
+        return False
+
+if __name__ == "__main__":
+    success = main()
+    sys.exit(0 if success else 1)
+CONFIG_EOF
+    
+    chmod +x "$INSTALL_DIR/configure.py"
+    
     log "✅ Python script installed at $INSTALL_DIR/outline_monitor_interactive.py"
+    log "✅ Configuration helper installed at $INSTALL_DIR/configure.py"
 }
 
 # Create systemd service
@@ -740,8 +1342,14 @@ case "$1" in
         echo "✅ All iptables rules cleared"
         ;;
     setup)
-        echo "🔧 Running interactive setup..."
-        sudo python3 /opt/outline-monitor/outline_monitor_interactive.py
+        echo "🔧 Running interactive port setup..."
+        python3 /opt/outline-monitor/configure.py
+        if [ $? -eq 0 ]; then
+            echo "✅ Port configuration completed!"
+            echo "🚀 You can now start monitoring with: outline-monitor start"
+        else
+            echo "❌ Port configuration failed"
+        fi
         ;;
     delete)
         echo "🗑️  COMPLETE UNINSTALL - This will remove everything!"
@@ -941,7 +1549,7 @@ UNINSTALL_EOF
 
 # Interactive setup
 interactive_setup() {
-    log "🔧 Starting interactive setup..."
+    log "🔧 Starting interactive port configuration..."
     
     echo -e "${YELLOW}"
     echo "=========================================================================="
@@ -949,11 +1557,13 @@ interactive_setup() {
     echo "=========================================================================="
     echo -e "${NC}"
     
-    # Run the interactive setup
-    python3 "$INSTALL_DIR/outline_monitor_interactive.py" || {
-        log_error "Interactive setup failed"
-        exit 1
-    }
+    # Run the port configuration helper
+    if python3 "$INSTALL_DIR/configure.py"; then
+        log "✅ Port configuration completed successfully"
+    else
+        log_warning "Port configuration failed - you can run it later with: outline-monitor setup"
+        return 1
+    fi
 }
 
 # Configure firewall
@@ -969,20 +1579,13 @@ configure_firewall() {
 
 # Enable and start service
 enable_service() {
-    log "🎯 Enabling and starting service..."
+    log "🎯 Enabling service (will start later)..."
     
-    # Enable service
+    # Enable service (but don't start yet)
     systemctl enable "$SERVICE_NAME"
     
-    # Start service
-    systemctl start "$SERVICE_NAME"
-    
-    # Check status
-    if systemctl is-active --quiet "$SERVICE_NAME"; then
-        log "✅ Service started successfully"
-    else
-        log_warning "Service may have issues. Check with: outline-monitor status"
-    fi
+    log "✅ Service enabled for auto-start on boot"
+    log "⚠️  Service will start after port configuration"
 }
 
 # Print completion message
@@ -1010,12 +1613,13 @@ print_completion() {
     echo "  outline-monitor clean      # Clear all blocks"
     echo "  outline-monitor delete     # COMPLETELY REMOVE system"
     echo
-    echo -e "${GREEN}✅ The system is now monitoring ALL ports (1024-65535) except your management port${NC}"
+    echo -e "${GREEN}✅ The system is now configured to monitor ALL ports (1024-65535) except your management port${NC}"
     echo -e "${GREEN}✅ Auto-start on boot is enabled${NC}"
-    echo -e "${GREEN}✅ 2-minute IP blocking with 1-second monitoring is active${NC}"
+    echo -e "${GREEN}✅ 2-minute IP blocking with 1-second monitoring will be active after port setup${NC}"
     echo
-    echo -e "${PURPLE}🚀 To check the current status: outline-monitor status${NC}"
-    echo -e "${PURPLE}📊 To view live logs: outline-monitor tail${NC}"
+    echo -e "${PURPLE}🚀 To start monitoring: outline-monitor start${NC}"
+    echo -e "${PURPLE}📊 To check status: outline-monitor status${NC}"
+    echo -e "${PURPLE}� To reconfigure port: outline-monitor setup${NC}"
     echo
 }
 
@@ -1034,6 +1638,7 @@ main() {
     create_management_scripts
     configure_firewall
     enable_service
+    interactive_setup
     
     print_completion
     
